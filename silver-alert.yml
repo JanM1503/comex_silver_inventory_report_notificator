@@ -1,0 +1,51 @@
+name: Silver Alert
+
+on:
+  schedule:
+    # Stuendlich von 19:15 bis 06:15 UTC (21:15 bis 08:15 Schweizer Sommerzeit).
+    # Sobald die tatsaechliche Veroeffentlichungszeit bekannt ist, kann das enger gefasst werden.
+    - cron: "15 19-23,0-6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Auch senden, wenn der Report schon gemeldet wurde (zum Testen)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: silver-alert
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhaengigkeit installieren
+        run: pip install xlrd
+
+      - name: Report holen und Push senden
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            python silver_alert.py --force
+          else
+            python silver_alert.py
+          fi
+
+      - name: Gemeldeten Report speichern
+        run: |
+          [ -f state/last_report.txt ] || exit 0
+          git config user.name "silver-alert"
+          git config user.email "silver-alert@users.noreply.github.com"
+          git add state/last_report.txt
+          git diff --cached --quiet || (git commit -m "Report $(cat state/last_report.txt) gemeldet" && git push)
