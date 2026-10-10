@@ -1,0 +1,55 @@
+name: Silver Alert
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_push:
+        description: "Nur einen Test Push mit dem aktuellen Report senden"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: silver-alert
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhaengigkeit installieren
+        run: pip install xlrd
+
+      - name: Report beobachten
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_PUSH: ${{ inputs.test_push }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$TEST_PUSH" = "true" ]; then
+            python silver_alert.py --test-push
+          elif [ "$EVENT" = "workflow_dispatch" ]; then
+            python silver_alert.py --once
+          else
+            python silver_alert.py
+          fi
+
+      - name: Zustand speichern
+        if: always()
+        run: |
+          [ -d state ] || exit 0
+          git config user.name "silver-alert"
+          git config user.email "silver-alert@users.noreply.github.com"
+          git add state
+          git diff --cached --quiet || (git commit -m "Beobachtung gespeichert" && git push)
