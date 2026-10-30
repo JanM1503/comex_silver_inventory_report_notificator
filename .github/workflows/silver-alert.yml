@@ -29,7 +29,7 @@ jobs:
           python-version: "3.12"
 
       - name: Abhaengigkeit installieren
-        run: pip install xlrd
+        run: pip install xlrd curl_cffi
 
       - name: Report beobachten
         env:

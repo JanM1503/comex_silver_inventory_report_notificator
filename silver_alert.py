@@ -112,16 +112,47 @@ class Report:
     last_modified: "datetime | None"
 
 
-def download(url: str):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "silver-stocks-personal-alert/1.0",
-            "Accept": "application/vnd.ms-excel,*/*",
-        },
-    )
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/vnd.ms-excel,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cmegroup.com/clearing/operations-and-deliveries/nymex-delivery-notices.html",
+}
+
+
+def _download_impersonated(url: str):
+    """Abruf mit dem TLS Fingerabdruck von Chrome (curl_cffi). CME blockt reine Python Abrufe mit 403."""
+    try:
+        from curl_cffi import requests as cr
+    except ImportError as exc:
+        raise OSError(f"curl_cffi nicht installiert: {exc}")
+    try:
+        resp = cr.get(url, impersonate="chrome", headers=BROWSER_HEADERS, timeout=60)
+    except Exception as exc:  # curl_cffi hat eigene Fehlerklassen
+        raise OSError(f"curl_cffi Abruf fehlgeschlagen: {exc}")
+    if resp.status_code != 200:
+        raise OSError(f"HTTP Error {resp.status_code} (curl_cffi)")
+    return resp.content, resp.headers.get("Last-Modified")
+
+
+def _download_urllib(url: str):
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.read(), resp.headers.get("Last-Modified")
+
+
+def download(url: str):
+    """Erst Chrome Fingerabdruck, dann klassisch per urllib mit Browser Headern."""
+    errors = []
+    for fn in (_download_impersonated, _download_urllib):
+        try:
+            return fn(url)
+        except (urllib.error.URLError, OSError) as exc:
+            errors.append(f"{fn.__name__}: {exc}")
+    raise OSError(" | ".join(errors))
 
 
 def parse(data: bytes):
