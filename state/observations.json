@@ -1,9 +1,9 @@
 {
  "last_seen": {
-  "report_date": "2026-11-06",
-  "hash": "10168f7fb2721b2e825c89396e9e544ea140ab505b0840d7d7c116176c588e2f"
+  "report_date": "2026-11-09",
+  "hash": "b01cfb587f97baf4003f0dd95bba04e407c9ee9198d13834bca81ab00828e0e9"
  },
- "last_probe_utc": "2026-11-09T18:19:49Z",
+ "last_probe_utc": "2026-11-10T01:28:17Z",
  "events": [
   {
    "kind": "new_report",
@@ -130,6 +130,13 @@
    "detected_utc": "2026-11-06T21:27:49Z",
    "lower_utc": "2026-11-06T00:09:26Z",
    "last_modified_utc": "2026-11-06T20:04:57Z"
+  },
+  {
+   "kind": "new_report",
+   "report_date": "2026-11-09",
+   "detected_utc": "2026-11-10T01:28:17Z",
+   "lower_utc": "2026-11-09T18:19:49Z",
+   "last_modified_utc": "2026-11-09T20:04:07Z"
   }
  ],
  "learning_announced": true
