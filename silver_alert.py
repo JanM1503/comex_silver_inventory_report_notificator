@@ -1,26 +1,8 @@
 #!/usr/bin/env python3
-"""COMEX Silber Lagerbestand: Push aufs Handy mit der Veraenderung zum Vortag.
+"""COMEX Silber: jeden Abruf archivieren, neue Reports per ntfy melden.
 
-Das Skript beobachtet die CME Datei Silver_stocks.xls und meldet jeden neuen Report
-(Total, Eligible, Registered mit Veraenderung in Prozent) per ntfy aufs Handy.
-
-Den Zeitpunkt der Veroeffentlichung findet es selbst heraus. Jede Stunde startet eine kurze
-Sitzung (GitHub Actions). Je nach Wissensstand fragt sie unterschiedlich oft ab:
-
-  Phase 1, Suchen:      noch kein Zeitpunkt bekannt, Abfrage alle 15 Minuten, rund um die Uhr
-  Phase 2, Verfeinern:  ein grobes Zeitfenster ist bekannt, im Fenster (plus 2 Stunden Reserve)
-                        alle 5 Minuten, ausserhalb nur eine Abfrage pro Stunde
-  Phase 3, Gelernt:     Zeitfenster aus 5 genauen Beobachtungen, nur noch dort alle 3 Minuten,
-                        danach bei Verspaetung alle 15 Minuten bis 4 Stunden nach dem Fenster
-
-Alle Beobachtungen stehen in state/observations.json. Alles wird in UTC gerechnet. Nach einer
-Zeitumstellung (Schweiz oder USA) wird das Fenster vorsichtshalber 10 Tage lang breiter gehalten.
-
-Aufruf:
-    python silver_alert.py                normale Sitzung (braucht NTFY_TOPIC)
-    python silver_alert.py --once         genau eine Abfrage mit voller Auswertung
-    python silver_alert.py --test-push    aktuellen Report einmal als Test senden
-    python silver_alert.py --file X.xls   nur anzeigen, was aus einer lokalen Datei wuerde
+Jeder Start fragt CME ab, unabhaengig vom Wochentag und der Uhrzeit.
+Fehlgeschlagene Nachrichten bleiben im lokalen Reportarchiv ausstehend.
 """
 import argparse
 import hashlib
@@ -32,8 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from datetime import time as dtime
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -46,11 +27,12 @@ NTFY_SERVER = "https://ntfy.sh"
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 LAST_REPORT_FILE = STATE_DIR / "last_report.txt"  # Datum des zuletzt gemeldeten Reports
-OBS_FILE = STATE_DIR / "observations.json"  # Beobachtungen fuer das Lernen
+OBS_FILE = STATE_DIR / "observations.json"
+REPORT_DIR = STATE_DIR / "reports"
+TEST_RECEIPT = STATE_DIR / "last_test_push.json"
 
 UTC = timezone.utc
 ZURICH = ZoneInfo("Europe/Zurich")
-CHICAGO = ZoneInfo("America/Chicago")
 
 # Reihenfolge der Meldung: Total, Eligible, Registered
 ROWS = [
@@ -59,23 +41,8 @@ ROWS = [
     ("Registered", "TOTAL REGISTERED"),
 ]
 
-SESSION_MAX = timedelta(minutes=57)
-LEARN_EVENTS = 5  # genaue Beobachtungen bis zum Status "gelernt"
-PRECISE = timedelta(minutes=45)  # so eng muss der Zeitpunkt eingegrenzt sein
-RECENT = 7  # so viele letzte Reports bestimmen das Fenster
-KEEP = 40  # so viele Eintraege pro Art bleiben im Protokoll
-
-SCAN_INTERVAL = 15 * 60
-REFINE_INTERVAL = 5 * 60
-FINE_INTERVAL = 3 * 60
-LATE_INTERVAL = 15 * 60
-RETRY_SECONDS = 60
-MAX_ERRORS = 4
-
-MARGIN_REFINE = timedelta(hours=2)
-MARGIN = timedelta(minutes=30)
-MARGIN_DST = timedelta(minutes=90)
-LATE_EXTRA = timedelta(hours=4)  # so lange wird nach dem Fenster weiter gesucht
+KEEP = 40  # Begrenzung nur der Beobachtungen, nicht des Reportarchivs
+RETRY_DELAYS = (30, 90, 180)
 
 
 # ---------------------------------------------------------------- Zeit, austauschbar fuer Tests
@@ -233,7 +200,8 @@ def build_message(report_date, data, detected=None):
     return title, "\n".join(lines)
 
 
-def send_ntfy(topic: str, title: str, body: str) -> None:
+def send_ntfy(topic: str, title: str, body: str) -> str:
+    """Gibt ausschliesslich die Nachrichten-ID des Servers zurueck."""
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{topic}",
         data=body.encode("utf-8"),
@@ -241,277 +209,227 @@ def send_ntfy(topic: str, title: str, body: str) -> None:
         headers={"Title": title, "Tags": "bar_chart"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
-        resp.read()
+        try:
+            payload = json.loads(resp.read())
+        except (ValueError, UnicodeError):
+            raise OSError("ntfy: Antwort ohne lesbare JSON-Bestaetigung") from None
+    msg_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(msg_id, str) or not msg_id.strip():
+        raise OSError("ntfy: Antwort ohne Nachrichten-ID")
+    return msg_id
 
 
-# ---------------------------------------------------------------- Zustand
+# ---------------------------------------------------------------- Persistenter Zustand
+def atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(text, encoding="utf-8")
+    temp.replace(path)
+
+
+def write_json(path: Path, value: dict) -> None:
+    atomic_text(path, json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def read_json(path: Path) -> dict:
+    # Beschaedigte Zustandsdateien nicht stillschweigend ueberschreiben.
+    result = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict):
+        raise ValueError(f"Ungueltiger JSON-Zustand: {path.name}")
+    return result
+
+
 def load_obs() -> dict:
-    try:
-        obs = json.loads(OBS_FILE.read_text())
-    except (OSError, ValueError):
-        obs = {}
+    obs = read_json(OBS_FILE) if OBS_FILE.exists() else {}
     obs.setdefault("last_seen", None)
     obs.setdefault("last_probe_utc", None)
     obs.setdefault("events", [])
-    obs.setdefault("learning_announced", False)
     return obs
 
 
 def save_obs(obs: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
     reports = [e for e in obs["events"] if e["kind"] == "new_report"][-KEEP:]
     others = [e for e in obs["events"] if e["kind"] != "new_report"][-KEEP:]
     obs["events"] = sorted(reports + others, key=lambda e: e["detected_utc"])
-    OBS_FILE.write_text(json.dumps(obs, indent=1, ensure_ascii=False) + "\n")
+    write_json(OBS_FILE, obs)
 
 
 def notified_date():
     try:
         return date.fromisoformat(LAST_REPORT_FILE.read_text().strip())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
 
 
 def mark_notified(d: date) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    LAST_REPORT_FILE.write_text(d.isoformat() + "\n")
+    previous = notified_date()
+    if previous is None or d > previous:
+        atomic_text(LAST_REPORT_FILE, d.isoformat() + "\n")
 
 
-def register(obs: dict, rep: Report, t: datetime, prev_probe) -> "str | None":
-    """Vergleicht mit der letzten Beobachtung und protokolliert Aenderungen."""
+def register(obs: dict, rep: Report, t: datetime) -> str:
     seen = obs["last_seen"]
-    kind = None
-    if seen is not None:
-        if rep.report_date > date.fromisoformat(seen["report_date"]):
-            kind = "new_report"
-        elif rep.digest != seen["hash"]:
-            kind = "file_change"
-    if kind:
-        obs["events"].append(
-            {
-                "kind": kind,
-                "report_date": rep.report_date.isoformat(),
-                "detected_utc": iso(t),
-                "lower_utc": iso(prev_probe) if prev_probe else None,
-                "last_modified_utc": iso(rep.last_modified) if rep.last_modified else None,
-            }
-        )
+    kind = "unveraendert"
+    if seen is None:
+        kind = "new_report"
+    elif rep.report_date < date.fromisoformat(seen["report_date"]):
+        return "aelterer Report"
+    elif rep.report_date > date.fromisoformat(seen["report_date"]):
+        kind = "new_report"
+    elif rep.digest != seen["hash"]:
+        kind = "file_change"
+    if kind in ("new_report", "file_change"):
+        obs["events"].append({
+            "kind": kind,
+            "report_date": rep.report_date.isoformat(),
+            "detected_utc": iso(t),
+            "lower_utc": obs["last_probe_utc"],
+            "last_modified_utc": iso(rep.last_modified) if rep.last_modified else None,
+        })
     obs["last_seen"] = {"report_date": rep.report_date.isoformat(), "hash": rep.digest}
     return kind
 
 
-# ---------------------------------------------------------------- Lernen und Zeitplan
-def report_events(obs: dict) -> list:
-    return [e for e in obs["events"] if e["kind"] == "new_report"]
+def snapshot(rep: Report, detected: datetime) -> dict:
+    title, body = build_message(rep.report_date, rep.data, detected)
+    return {
+        "report_date": rep.report_date.isoformat(),
+        "detected_utc": iso(detected),
+        "last_modified_utc": iso(rep.last_modified) if rep.last_modified else None,
+        "sha256": rep.digest,
+        "unit": "troy_oz",
+        "inventory": {
+            name: {
+                "previous": prev,
+                "current": today,
+                "change": today - prev,
+                "change_percent": (today - prev) / prev * 100 if prev else None,
+            }
+            for name, (prev, today) in rep.data.items()
+        },
+        "title": title,
+        "body": body,
+    }
 
 
-def bounds(ev: dict):
-    """Gibt (fruehester Zeitpunkt, spaetester Zeitpunkt, genau?) der Veroeffentlichung zurueck."""
-    hi = parse_iso(ev["detected_utc"])
-    lo = parse_iso(ev["lower_utc"]) if ev.get("lower_utc") else None
-    if ev.get("last_modified_utc"):
-        lm = parse_iso(ev["last_modified_utc"])
-        if hi - timedelta(hours=36) <= lm <= hi:  # nur glaubwuerdige Zeitstempel
-            lo = max(lo, lm) if lo else lm
-    precise = lo is not None and hi - lo <= PRECISE
-    if lo is None or hi - lo > LATE_EXTRA:
-        lo = hi - LATE_EXTRA
-    return lo, hi, precise
-
-
-def precise_count(events: list) -> int:
-    return sum(1 for e in events if bounds(e)[2])
-
-
-def boundary_minute(events: list) -> int:
-    """Tagesgrenze in Minuten ab Mitternacht UTC: 12 Stunden vom letzten Report entfernt."""
-    if not events:
-        return 12 * 60
-    t = parse_iso(events[-1]["detected_utc"])
-    return (t.hour * 60 + t.minute + 12 * 60) % (24 * 60)
-
-
-def day_start(t: datetime, bmin: int) -> datetime:
-    shifted = t - timedelta(minutes=bmin)
-    return datetime.combine(shifted.date(), dtime(0, 0), tzinfo=UTC) + timedelta(minutes=bmin)
-
-
-def release_window(events: list, ds: datetime, bmin: int):
-    """Typisches Fenster der letzten Reports, auf den Tag ab ds uebertragen."""
-    offs_lo, offs_hi = [], []
-    for ev in events[-RECENT:]:
-        lo, hi, _ = bounds(ev)
-        d0 = day_start(hi, bmin)
-        offs_lo.append(lo - d0)
-        offs_hi.append(hi - d0)
-    return ds + min(offs_lo), ds + max(offs_hi)
-
-
-def recent_dst_change(ds: datetime) -> bool:
-    """Wahr, wenn in der Schweiz oder in Chicago in den letzten 10 Tagen die Uhr umgestellt wurde."""
-    ref = datetime.combine(ds.date(), dtime(12, 0), tzinfo=UTC)
-    before = ref - timedelta(days=10)
-    return any(ref.astimezone(tz).utcoffset() != before.astimezone(tz).utcoffset() for tz in (ZURICH, CHICAGO))
-
-
-def decide(now: datetime, obs: dict, end: datetime):
-    """Gibt ("stop", Grund), ("wait", Sekunden) oder ("probe", Sekunden bis zur naechsten Abfrage) zurueck.
-
-    Bei ("probe", None) wird genau einmal abgefragt und die Sitzung dann beendet."""
-    if now >= end:
-        return "stop", "Sitzungsende erreicht"
-    events = report_events(obs)
-    bmin = boundary_minute(events)
-    ds = day_start(now, bmin)
-    if events and day_start(parse_iso(events[-1]["detected_utc"]), bmin) == ds:
-        return "stop", "Der Report dieses Tages ist schon erkannt"
-
-    precise = precise_count(events)
-    if precise == 0:
-        return "probe", SCAN_INTERVAL  # Phase 1: Suchen
-
-    lo, hi = release_window(events, ds, bmin)
-    if precise < LEARN_EVENTS:  # Phase 2: Verfeinern
-        lo, hi = lo - MARGIN_REFINE, hi + MARGIN_REFINE
-        if lo <= now <= hi:
-            return "probe", REFINE_INTERVAL
-        return "probe", None
-
-    # Phase 3: Gelernt
-    active = {day_start(parse_iso(e["detected_utc"]), bmin).weekday() for e in events[-20:]}
-    if ds.weekday() not in active:
-        return "stop", "An diesem Wochentag kommt normalerweise kein Report"
-    margin = MARGIN_DST if recent_dst_change(ds) else MARGIN
-    lo, hi = lo - margin, hi + margin
-    if now < lo:
-        return "wait", (lo - now).total_seconds()
-    if now <= hi:
-        return "probe", FINE_INTERVAL
-    if now <= hi + LATE_EXTRA:
-        return "probe", LATE_INTERVAL
-    return "stop", "Fenster ohne neuen Report zu Ende"
-
-
-def learned(obs: dict) -> bool:
-    return precise_count(report_events(obs)) >= LEARN_EVENTS
-
-
-def summary(obs: dict, now: datetime) -> str:
-    events = report_events(obs)
-    if not events:
-        return "Noch kein neuer Report beobachtet (Phase 1, Suchen)."
-    p = precise_count(events)
-    phase = "Phase 3, gelernt" if p >= LEARN_EVENTS else "Phase 2, Verfeinern"
-    text = f"Beobachtete Reports: {len(events)}, genau eingegrenzt: {p} von {LEARN_EVENTS} ({phase})."
-    bmin = boundary_minute(events)
-    lo, hi = release_window(events, day_start(now, bmin), bmin)
-    text += f" Bisheriges Fenster: {fmt_ch(lo)} bis {fmt_ch(hi)} Uhr Schweizer Zeit."
-    return text
-
-
-def announce_learning(obs: dict, topic: str, now: datetime) -> None:
-    if obs["learning_announced"] or not learned(obs):
+def archive_report(rep: Report, detected: datetime) -> None:
+    path = REPORT_DIR / (rep.report_date.isoformat() + ".json")
+    if path.exists():
+        # Erste Beobachtung und versendete Zahlen unveraendert lassen.
+        # Korrigierte CME-Dateien als weitere Version dokumentieren.
+        entry = read_json(path)
+        revisions = entry.get("revisions", [])
+        if rep.digest != entry["sha256"] and not any(
+            r["sha256"] == rep.digest for r in revisions
+        ):
+            entry.setdefault("revisions", []).append(snapshot(rep, detected))
+            write_json(path, entry)
         return
-    events = report_events(obs)
-    bmin = boundary_minute(events)
-    lo, hi = release_window(events, day_start(now, bmin), bmin)
-    body = (
-        f"Der Report erscheint meist zwischen {fmt_ch(lo)} und {fmt_ch(hi)} Uhr Schweizer Zeit. "
-        "Ab jetzt wird nur noch rund um diese Zeit geprüft."
-    )
-    try:
-        send_ntfy(topic, "Silber Alert: Zeitfenster gefunden", body)
-        obs["learning_announced"] = True
-    except (urllib.error.URLError, OSError) as exc:
-        log(f"Hinweis zum Zeitfenster konnte nicht gesendet werden: {exc}")
+    entry = snapshot(rep, detected)
+    cutoff = notified_date()
+    entry["delivery"] = {
+        "status": "legacy_cutoff" if cutoff is not None and rep.report_date <= cutoff else "pending",
+        "attempts": 0,
+        "ntfy_id": None,
+        "accepted_utc": None,
+    }
+    write_json(path, entry)
+    log(f"Report archiviert: {rep.report_date} ({entry['delivery']['status']})")
 
 
-# ---------------------------------------------------------------- Sitzung
-def run_session(topic: str, once: bool = False) -> int:
-    obs = load_obs()
-    start = _now()
-    end = start + SESSION_MAX
-    prev_probe = parse_iso(obs["last_probe_utc"]) if obs.get("last_probe_utc") else None
-    notified = notified_date()
-    errors = 0
-    send_failed = False
-    log(f"Sitzung ab {start:%Y-%m-%d %H:%M} UTC ({fmt_ch(start)} Uhr Schweizer Zeit)")
-
-    while True:
-        now = _now()
-        remaining = (end - now).total_seconds()
-        if once:
-            action, arg = "probe", None
-        else:
-            action, arg = decide(now, obs, end)
-
-        if action == "stop":
-            log(f"Ende: {arg}")
-            break
-        if action == "wait":
-            if arg >= remaining:
-                log("Ende: Das Suchfenster beginnt erst nach dieser Sitzung")
-                break
-            log(f"Warte bis {fmt_ch(now + timedelta(seconds=arg))} Uhr Schweizer Zeit auf den Beginn des Fensters")
-            _sleep(arg)
+def publish_pending(topic: str) -> bool:
+    # Auch bei CME-Ausfall werden bereits archivierte Meldungen erneut versucht.
+    # Datumsgerechte Reihenfolge, kein Ueberspringen eines fehlgeschlagenen Versands.
+    for path in sorted(REPORT_DIR.glob("????-??-??.json")):
+        entry = read_json(path)
+        delivery = entry["delivery"]
+        if delivery["status"] == "accepted":
+            # Repariert den Marker, falls der vorige Prozess nach Archivierung endete.
+            mark_notified(date.fromisoformat(entry["report_date"]))
             continue
-
+        if delivery["status"] != "pending":
+            continue
+        delivery["attempts"] += 1
+        delivery["last_attempt_utc"] = iso(_now())
+        write_json(path, entry)
         try:
-            rep = fetch_report()
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            errors += 1
-            log(f"Abruf fehlgeschlagen ({errors} von {MAX_ERRORS}): {exc}")
-            if errors >= MAX_ERRORS:
-                save_obs(obs)
-                return 1
-            _sleep(RETRY_SECONDS)
-            continue
-        errors = 0
-
-        kind = register(obs, rep, now, prev_probe)
-        prev_probe = now
-        obs["last_probe_utc"] = iso(now)
-        what = {"new_report": "NEUER REPORT", "file_change": "Datei geändert"}.get(kind, "unverändert")
-        lm = rep.last_modified.strftime("%Y-%m-%d %H:%M UTC") if rep.last_modified else "nicht angegeben"
-        log(f"Abfrage {now:%H:%M} UTC ({fmt_ch(now)} Uhr CH): Report {rep.report_date}, {what}, Last-Modified: {lm}")
-
-        if notified is None or rep.report_date > notified:
-            title, body = build_message(rep.report_date, rep.data, now)
-            try:
-                send_ntfy(topic, title, body)
-            except (urllib.error.URLError, OSError) as exc:
-                log(f"Senden fehlgeschlagen, neuer Versuch bei der nächsten Abfrage: {exc}")
-                send_failed = True
-            else:
-                notified = rep.report_date
-                mark_notified(notified)
-                send_failed = False
-                announce_learning(obs, topic, now)
-                save_obs(obs)
-                log("Push gesendet.")
-                log(summary(obs, now))
-                return 0
-
-        if once or arg is None:
-            break
-        if (end - _now()).total_seconds() <= arg:
-            log("Ende: Sitzungszeit aufgebraucht")
-            break
-        _sleep(arg)
-
-    save_obs(obs)
-    log(summary(obs, _now()))
-    return 1 if send_failed else 0
+            msg_id = send_ntfy(topic, entry["title"], entry["body"])
+        except (OSError, ValueError):
+            # Keine URL, kein Topic und kein unbereinigter Antwortinhalt im oeffentlichen Log.
+            delivery["last_error"] = "ntfy publish not confirmed"
+            write_json(path, entry)
+            log(f"Push nicht bestaetigt: {entry['report_date']}; erneuter Versuch beim naechsten Lauf.")
+            return False
+        delivery.update(status="accepted", ntfy_id=msg_id, accepted_utc=iso(_now()))
+        delivery.pop("last_error", None)
+        write_json(path, entry)
+        mark_notified(date.fromisoformat(entry["report_date"]))
+        log(f"Push vom ntfy-Server angenommen: {entry['report_date']}, ID {msg_id}")
+    return True
 
 
-# ---------------------------------------------------------------- Aufruf
+def fetch_with_retry() -> Report:
+    for attempt in range(len(RETRY_DELAYS) + 1):
+        try:
+            return fetch_report()
+        except (OSError, ValueError) as exc:
+            log(f"CME-Abruf fehlgeschlagen ({attempt + 1}/{len(RETRY_DELAYS) + 1}): {exc}")
+            if attempt == len(RETRY_DELAYS):
+                raise
+            _sleep(RETRY_DELAYS[attempt])
+
+
+def run_session(topic: str, once: bool = False) -> int:
+    # --once bleibt kompatibel: jetzt ist jeder regulaere Lauf eine kurze Sitzung.
+    obs = load_obs()
+    fetch_ok = True
+    try:
+        rep = fetch_with_retry()
+    except (OSError, ValueError):
+        fetch_ok = False
+    else:
+        detected = _now()
+        archive_report(rep, detected)
+        kind = register(obs, rep, detected)
+        obs["last_probe_utc"] = iso(detected)
+        save_obs(obs)
+        lm = iso(rep.last_modified) if rep.last_modified else "nicht angegeben"
+        log(f"CME: Report {rep.report_date}, {kind}, Last-Modified: {lm}")
+    sent_ok = publish_pending(topic)
+    return 0 if fetch_ok and sent_ok else 1
+
+
+def test_push(topic: str) -> int:
+    try:
+        rep = fetch_with_retry()
+    except (OSError, ValueError):
+        log("Test fehlgeschlagen: CME-Abruf")
+        return 1
+    entry = snapshot(rep, _now())
+    title = "TEST - " + entry["title"]
+    try:
+        msg_id = send_ntfy(topic, title, entry["body"])
+    except (OSError, ValueError):
+        log("Test fehlgeschlagen: ntfy-Versand nicht bestaetigt")
+        return 1
+    entry["title"] = title
+    entry["delivery"] = {
+        "status": "accepted",
+        "ntfy_id": msg_id,
+        "accepted_utc": iso(_now()),
+        "attempts": 1,
+    }
+    write_json(TEST_RECEIPT, entry)
+    log(f"Test-Push vom ntfy-Server angenommen. ID {msg_id}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--file", help="lokale xls Datei nur anzeigen")
-    ap.add_argument("--once", action="store_true", help="genau eine Abfrage")
-    ap.add_argument("--test-push", action="store_true", help="aktuellen Report einmal als Test senden")
+    ap.add_argument("--once", action="store_true", help="einmaliger regulaerer Abruf")
+    ap.add_argument("--test-push", action="store_true", help="aktuellen Report als Test senden")
     args = ap.parse_args()
-
     if args.file:
         try:
             report_date, data = parse(Path(args.file).read_bytes())
@@ -522,23 +440,12 @@ def main() -> int:
         print(title)
         print(body)
         return 0
-
     topic = os.environ.get("NTFY_TOPIC", "").strip()
     if not topic:
         print("NTFY_TOPIC ist nicht gesetzt.", file=sys.stderr)
         return 1
-
     if args.test_push:
-        try:
-            rep = fetch_report()
-            title, body = build_message(rep.report_date, rep.data)
-            send_ntfy(topic, title, body)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            print(f"Test fehlgeschlagen: {exc}", file=sys.stderr)
-            return 1
-        print("Test Push gesendet.")
-        return 0
-
+        return test_push(topic)
     return run_session(topic, once=args.once)
 
 
