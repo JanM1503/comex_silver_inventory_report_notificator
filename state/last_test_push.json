@@ -1,6 +1,6 @@
 {
   "report_date": "2026-11-25",
-  "detected_utc": "2026-11-27T17:15:46Z",
+  "detected_utc": "2026-11-27T17:16:57Z",
   "last_modified_utc": "2026-11-25T19:04:07Z",
   "sha256": "492a5f7c529adfb8f948247c211eec6c3ec39e14d89112f8566a832d2d2a338c",
   "unit": "troy_oz",
@@ -25,11 +25,11 @@
     }
   },
   "title": "TEST - COMEX Silber, Report 25.11.2026",
-  "body": "Total: ▼ -0.83% (-2.72M oz), jetzt 326.35M oz\nEligible: ▼ -0.99% (-2.28M oz), jetzt 228.45M oz\nRegistered: ▼ -0.45% (-439.3K oz), jetzt 97.90M oz\nErkannt um 18:15 Uhr Schweizer Zeit",
+  "body": "Total: ▼ -0.83% (-2.72M oz), jetzt 326.35M oz\nEligible: ▼ -0.99% (-2.28M oz), jetzt 228.45M oz\nRegistered: ▼ -0.45% (-439.3K oz), jetzt 97.90M oz\nErkannt um 18:16 Uhr Schweizer Zeit",
   "delivery": {
     "status": "accepted",
-    "ntfy_id": "6RaJ8aKtvw93",
-    "accepted_utc": "2026-11-27T17:15:46Z",
+    "ntfy_id": "kkbsGv7WHbp3",
+    "accepted_utc": "2026-11-27T17:16:58Z",
     "attempts": 1
   }
 }
