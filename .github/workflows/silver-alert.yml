@@ -2,54 +2,85 @@ name: Silver Alert
 
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       test_push:
-        description: "Nur einen Test Push mit dem aktuellen Report senden"
+        description: "Aktuellen Report als TEST Push senden"
         type: boolean
         default: false
+  pull_request:
+    paths:
+      - "silver_alert.py"
+      - "tests/**"
+      - ".github/workflows/silver-alert.yml"
+  push:
+    branches: [main]
+    paths:
+      - "silver_alert.py"
+      - "tests/**"
+      - ".github/workflows/silver-alert.yml"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: silver-alert
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  watch:
+  verify:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !contains(github.event.head_commit.message, '[ntfy-test]'))
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: pip install xlrd==2.0.2 curl_cffi
+      - run: python -m unittest discover -s tests -v
 
-      - name: Abhaengigkeit installieren
-        run: pip install xlrd curl_cffi
-
+  watch:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[ntfy-test]')))
+    permissions:
+      contents: write
+    concurrency:
+      group: silver-alert
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Immer den aktuellen main-Zustand auschecken, nicht den alten Schedule-SHA.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Abhaengigkeiten installieren
+        run: pip install xlrd==2.0.2 curl_cffi
+      - name: Regressionstests
+        run: python -m unittest discover -s tests -v
       - name: Report beobachten
+        id: report
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          TEST_PUSH: ${{ inputs.test_push }}
-          EVENT: ${{ github.event_name }}
+          TEST_PUSH: ${{ github.event_name == 'push' || inputs.test_push }}
         run: |
           if [ "$TEST_PUSH" = "true" ]; then
             python silver_alert.py --test-push
-          elif [ "$EVENT" = "workflow_dispatch" ]; then
-            python silver_alert.py --once
           else
-            python silver_alert.py
+            python silver_alert.py --once
           fi
-
       - name: Zustand speichern
-        if: always()
+        if: always() && (steps.report.outcome == 'success' || steps.report.outcome == 'failure')
         run: |
           [ -d state ] || exit 0
           git config user.name "silver-alert"
           git config user.email "silver-alert@users.noreply.github.com"
           git add state
-          git diff --cached --quiet || (git commit -m "Beobachtung gespeichert" && git push)
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Beobachtung gespeichert"
+          if ! git push origin HEAD:main; then
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
