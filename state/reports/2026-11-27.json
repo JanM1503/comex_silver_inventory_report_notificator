@@ -1,0 +1,36 @@
+{
+  "report_date": "2026-11-27",
+  "detected_utc": "2026-11-28T00:40:46Z",
+  "last_modified_utc": "2026-11-27T19:04:08Z",
+  "sha256": "273eb1e3f69ee6c5ccf119433f6b354c06ec7ced0b4ee670d03f7a622e975954",
+  "unit": "troy_oz",
+  "inventory": {
+    "Total": {
+      "previous": 326349813.05039996,
+      "current": 323004509.5494,
+      "change": -3345303.500999987,
+      "change_percent": -1.0250667741253934
+    },
+    "Eligible": {
+      "previous": 228446827.73439997,
+      "current": 225597340.7365,
+      "change": -2849486.9978999794,
+      "change_percent": -1.2473305171971527
+    },
+    "Registered": {
+      "previous": 97902985.31599998,
+      "current": 97407168.81289998,
+      "change": -495816.5031000078,
+      "change_percent": -0.506436551959747
+    }
+  },
+  "title": "COMEX Silber, Report 27.11.2026",
+  "body": "Total: ▼ -1.03% (-3.35M oz), jetzt 323.00M oz\nEligible: ▼ -1.25% (-2.85M oz), jetzt 225.60M oz\nRegistered: ▼ -0.51% (-495.8K oz), jetzt 97.41M oz\nErkannt um 01:40 Uhr Schweizer Zeit",
+  "delivery": {
+    "status": "accepted",
+    "attempts": 1,
+    "ntfy_id": "orHuKfNwTOue",
+    "accepted_utc": "2026-11-28T00:40:46Z",
+    "last_attempt_utc": "2026-11-28T00:40:46Z"
+  }
+}
